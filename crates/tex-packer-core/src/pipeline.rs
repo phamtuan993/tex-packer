@@ -5,8 +5,9 @@ use crate::model::{Atlas, Frame, Meta, Page, Rect};
 use crate::packer::{
     Packer, guillotine::GuillotinePacker, maxrects::MaxRectsPacker, skyline::SkylinePacker,
 };
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, GenericImageView, RgbaImage};
 use std::collections::{HashMap, HashSet};
+use std::ops::Index;
 use std::time::Instant;
 use tracing::instrument;
 
@@ -159,7 +160,9 @@ fn next_pow2(mut v: u32) -> u32 {
 
 struct Prep {
     key: String,
-    rgba: RgbaImage,
+    rgba: RgbaImage, // Original full image (needed for blitting)
+    content: Vec<u8>, // Cached raw pixels of the sub-rect (for fast comparison/hashing)
+    hash: u64,        // Pre-computed hash
     rect: Rect,
     trimmed: bool,
     source: Rect,
@@ -195,9 +198,19 @@ fn prepare_inputs(inputs: &[InputImage], cfg: &PackerConfig) -> Vec<Prep> {
         if !push_entry {
             continue;
         }
+        // Extract the actual pixel data for the sub-rect area once.
+        // This is the "content" we care about for deduplication.
+        let content = rgba.view(source.x, source.y, source.w, source.h)
+            .to_image()
+            .into_raw(); // Consumes the sub-image into a flat Vec<u8>
+
+        // Calculate hash using the ultra-fast XXH3 algorithm
+        let hash = xxhash_rust::const_xxh3::xxh3_64(&content);
         out.push(Prep {
             key: inp.key.clone(),
             rgba,
+            content,
+            hash,
             rect,
             trimmed,
             source,
@@ -236,13 +249,15 @@ fn prepare_inputs(inputs: &[InputImage], cfg: &PackerConfig) -> Vec<Prep> {
     out
 }
 
+
 fn pack_prepared(prepared: &[Prep], cfg: &PackerConfig) -> Result<PackOutput> {
     let mut pages: Vec<OutputPage> = Vec::new();
     let mut atlas_pages: Vec<Page> = Vec::new();
 
     // Map for quick lookup during compositing
     let prep_map: HashMap<String, &Prep> = prepared.iter().map(|p| (p.key.clone(), p)).collect();
-
+    // Stores indices of entry actually placed in the atlas to prevent duplicate rendering (blitting).
+    let mut in_packs: HashSet<usize> = HashSet::with_capacity(prepared.len());
     // Remaining indices to place (in sorted order)
     let mut remaining: Vec<usize> = (0..prepared.len()).collect();
     let mut page_id = 0usize;
@@ -267,6 +282,21 @@ fn pack_prepared(prepared: &[Prep], cfg: &PackerConfig) -> Result<PackOutput> {
             let mut remove_set: HashSet<usize> = HashSet::new();
             for &idx in &remaining {
                 let p = &prepared[idx];
+                let img_data= p.rgba.view(p.source.x,p.source.y,p.source.w,p.source.h);
+                if let Some(in_pack_same) = in_packs.iter().find(|x| {
+                    let _p: &Prep = &prepared[**x];
+                    p.hash == _p.hash && p.content == _p.content
+                }){
+                    let mut f  = frames[*in_pack_same].clone();
+                    f.trimmed = p.trimmed;
+                    f.source = p.source;
+                    f.source_size = p.orig_size;
+                    frames.push(f);
+                    remove_set.insert(idx);
+                    placed_any = true;
+                    continue;
+                }
+
                 if !packer.can_pack(&p.rect) {
                     continue;
                 }
@@ -276,6 +306,7 @@ fn pack_prepared(prepared: &[Prep], cfg: &PackerConfig) -> Result<PackOutput> {
                     f.source_size = p.orig_size;
                     frames.push(f);
                     remove_set.insert(idx);
+                    in_packs.insert(idx);
                     placed_any = true;
                 }
             }
@@ -301,7 +332,11 @@ fn pack_prepared(prepared: &[Prep], cfg: &PackerConfig) -> Result<PackOutput> {
         let (page_w, page_h) = compute_page_size(&frames, cfg);
 
         let mut canvas = RgbaImage::new(page_w, page_h);
-        for f in &frames {
+        for (i,f) in frames.iter().enumerate() {
+            // Only place frames that were actually placed
+            if !in_packs.contains(&i){
+                continue;
+            }
             if let Some(prep) = prep_map.get(&f.key) {
                 crate::compositing::blit_rgba(
                     &prep.rgba,
